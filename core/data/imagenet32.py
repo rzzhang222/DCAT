@@ -1,0 +1,240 @@
+import os
+import os.path
+from typing import Callable, Optional
+
+import numpy as np
+import torch
+import torchvision.transforms as transforms
+from PIL import Image
+from torchvision.datasets.vision import VisionDataset
+
+from .dataset import SemiSupervisedDataset
+
+DATA_DESC = {
+    'data': 'tiny-imagenet',
+    'classes': tuple(range(0, 100)),
+    'num_classes': 100,
+    'mean': (0.485, 0.456, 0.406),
+    'std': (0.229, 0.224, 0.225),
+}
+
+class ImageNet32(VisionDataset):
+    # http://image-net.org/download-images
+    # A Downsampled Variant of ImageNet as an Alternative to the CIFAR datasets
+    # https://arxiv.org/pdf/1707.08819.pdf
+
+    def __init__(self, root,
+                 train: bool = True,
+                 transform: Optional[Callable] = None,
+                 target_transform: Optional[Callable] = None,
+                 use_num_of_class_only=DATA_DESC['num_classes']):
+        super().__init__(root, transform=transform, target_transform=target_transform)
+        self.root = root
+        self.transform = transform
+        self.train = train
+
+        if self.train:
+            downloaded_list = ['train_data_batch_'+str(i) for i in range(1,11)]
+        else:
+            downloaded_list = ['val_data']
+        self.data = []
+        self.targets = []
+
+        # now load the picked numpy arrays
+        #for i, (file_name, checksum) in enumerate(downloaded_list):
+        for file_name in downloaded_list:
+            #file_path = os.path.join(self.root, '{}.npz'.format(file_name))
+            file_path = os.path.join(self.root, file_name)
+            entry = np.load(file_path,allow_pickle=True)
+            self.data.append(entry["data"])
+            self.targets.extend(entry["labels"])
+        self.data = np.vstack(self.data).reshape(-1, 3, 32, 32)
+        self.data = self.data.transpose((0, 2, 3, 1))  # convert to HWC
+
+        if use_num_of_class_only is not None:
+            assert (
+                isinstance(use_num_of_class_only, int)
+                and use_num_of_class_only > 0
+                and use_num_of_class_only < 1000
+            ), "invalid use_num_of_class_only : {:}".format(use_num_of_class_only)
+            new_data, new_targets = [], []
+            for I, L in zip(self.data, self.targets):
+                if 1 <= L <= use_num_of_class_only:
+                    new_data.append(I)
+                    new_targets.append(L - 1)
+            print(f'Train={train} new target: {set(new_targets)}')
+            self.data = new_data
+            self.targets = new_targets
+
+    def __repr__(self):
+        return "{name}({num} images, {classes} classes)".format(
+            name=self.__class__.__name__,
+            num=len(self.data),
+            classes=len(set(self.targets)),
+        )
+
+    def __getitem__(self, index):
+        img, target = self.data[index], self.targets[index]
+        img = Image.fromarray(img)
+
+        if self.transform is not None:
+            img = self.transform(img)
+
+        return img, target
+
+    def __len__(self):
+        return len(self.data)
+
+
+class SemiSupervisedImagenet32(SemiSupervisedDataset):
+
+    def load_base_dataset(self, train=False, **kwargs):
+        assert self.base_dataset == 'imagenet32', 'Only semi-supervised imagenet32 is supported. Please use correct dataset!'
+        self.dataset = ImageNet32(train=train, **kwargs)
+        self.dataset_size = len(self.dataset)
+        self.num_classes = DATA_DESC['num_classes']
+        self.mean_std = (DATA_DESC['mean'], DATA_DESC['std'])
+
+
+def load_imagenet32(data_dir, logger, use_augmentation='none', use_consistency=False,
+                       take_amount=10000, aux_take_amount=None, take_amount_seed=1,
+                       add_aux_labels=False, validation=False, pseudo_label_model=None,
+                       aux_data_filename=None
+                       ):
+
+    test_transform = transforms.Compose([transforms.Resize(32), transforms.ToTensor()])
+    if use_augmentation == 'base':
+        train_transform = transforms.Compose(
+            [transforms.Resize(32), transforms.RandomCrop(32, padding=4), transforms.RandomHorizontalFlip(0.5),
+             transforms.ToTensor()])
+    else:
+        train_transform = test_transform
+
+    train_dataset = SemiSupervisedImagenet32(base_dataset='imagenet32', root=data_dir, train=True,
+                                               transform=train_transform,
+                                               take_amount=take_amount,
+                                               take_amount_seed=take_amount_seed,
+                                               add_aux_labels=add_aux_labels,
+                                               aux_take_amount=aux_take_amount,
+                                               validation=validation,
+                                               pseudo_label_model=pseudo_label_model,
+                                               aux_data_filename=aux_data_filename,
+                                               logger=logger
+                                               )
+    test_dataset = SemiSupervisedImagenet32(base_dataset='imagenet32', root=data_dir, train=False,
+                                                transform=test_transform, logger=logger
+                                              )
+    if validation:
+        val_dataset = ImageNet32(root=data_dir, train=True, transform=test_transform)
+        val_dataset = torch.utils.data.Subset(val_dataset, train_dataset.val_indices)
+        return train_dataset, test_dataset, val_dataset
+    return train_dataset, test_dataset, None
+
+class twotransform():
+    def __init__(self,transform_w,transform_s):
+        self.transform_w=transform_w
+        self.transform_s=transform_s
+        
+    def __call__(self,x):
+        return [self.transform_w(x),self.transform_s(x)]
+class threetransform():
+    def __init__(self,transform_w,transform_s,transform_ss):
+        self.transform_w=transform_w
+        self.transform_s=transform_s
+        self.transform_ss=transform_ss
+        
+    def __call__(self,x):
+        return [self.transform_w(x),self.transform_s(x),self.transform_ss(x)]        
+        
+transform1 = transforms.Compose(
+             [#transforms.TrivialAugmentWide(num_magnitude_bins=31),
+            transforms.Resize(32),transforms.RandomCrop(32, padding=4), transforms.RandomHorizontalFlip(0.5), transforms.ToTensor()])  
+transform2 = transforms.Compose(
+            [transforms.TrivialAugmentWide(num_magnitude_bins=31),
+            transforms.Resize(32),
+             transforms.RandomCrop(32, padding=4), transforms.RandomHorizontalFlip(0.5),
+             transforms.ToTensor()])
+             
+transform3 = transforms.Compose([
+    transforms.RandomResizedCrop((32,32), scale=(0.2, 1.),interpolation=transforms.InterpolationMode.BICUBIC,),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomApply([
+            transforms.ColorJitter(0.8, 0.8, 0.8, 0.2)
+        ], p=0.8),
+        transforms.RandomGrayscale(p=0.2),
+        #transforms.RandomApply([GaussianBlur()],p=0.5),
+        transforms.ToTensor(),
+        #transforms.Normalize(mean,std),
+    ])               
+
+transform_double=twotransform(transform1, transform2) 
+transform_triple=threetransform(transform1,transform2,transform2)
+def load_imagenet32double(data_dir, logger, use_augmentation='none', use_consistency=False,
+                       take_amount=10000, aux_take_amount=None, take_amount_seed=1,
+                       add_aux_labels=False, validation=False, pseudo_label_model=None,
+                       aux_data_filename=None
+                       ):
+
+    test_transform = transforms.Compose([transforms.Resize(32), transforms.ToTensor()])
+    if use_augmentation == 'base':
+#        train_transform = transforms.Compose(
+#            [transforms.Resize(32), transforms.RandomCrop(32, padding=4), transforms.RandomHorizontalFlip(0.5),
+#             transforms.ToTensor()])
+         train_transform=transform_double
+    else:
+        train_transform = test_transform
+
+    train_dataset = SemiSupervisedImagenet32(base_dataset='imagenet32', root=data_dir, train=True,
+                                               transform=train_transform,
+                                               take_amount=take_amount,
+                                               take_amount_seed=take_amount_seed,
+                                               add_aux_labels=add_aux_labels,
+                                               aux_take_amount=aux_take_amount,
+                                               validation=validation,
+                                               pseudo_label_model=pseudo_label_model,
+                                               aux_data_filename=aux_data_filename,
+                                               logger=logger
+                                               )
+    test_dataset = SemiSupervisedImagenet32(base_dataset='imagenet32', root=data_dir, train=False,
+                                                transform=test_transform, logger=logger
+                                              )
+    if validation:
+        val_dataset = ImageNet32(root=data_dir, train=True, transform=test_transform)
+        val_dataset = torch.utils.data.Subset(val_dataset, train_dataset.val_indices)
+        return train_dataset, test_dataset, val_dataset
+    return train_dataset, test_dataset, None
+    
+def load_imagenet32triple(data_dir, logger, use_augmentation='none', use_consistency=False,
+                       take_amount=10000, aux_take_amount=None, take_amount_seed=1,
+                       add_aux_labels=False, validation=False, pseudo_label_model=None,
+                       aux_data_filename=None
+                       ):
+
+    test_transform = transforms.Compose([transforms.Resize(32), transforms.ToTensor()])
+    if use_augmentation == 'base':
+#        train_transform = transforms.Compose(
+#            [transforms.Resize(32), transforms.RandomCrop(32, padding=4), transforms.RandomHorizontalFlip(0.5),
+#             transforms.ToTensor()])
+         train_transform=transform_triple
+    else:
+        train_transform = test_transform
+
+    train_dataset = SemiSupervisedImagenet32(base_dataset='imagenet32', root=data_dir, train=True,
+                                               transform=train_transform,
+                                               take_amount=take_amount,
+                                               take_amount_seed=take_amount_seed,
+                                               add_aux_labels=add_aux_labels,
+                                               aux_take_amount=aux_take_amount,
+                                               validation=validation,
+                                               pseudo_label_model=pseudo_label_model,
+                                               aux_data_filename=aux_data_filename,
+                                               logger=logger
+                                               )
+    test_dataset = SemiSupervisedImagenet32(base_dataset='imagenet32', root=data_dir, train=False,
+                                                transform=test_transform, logger=logger
+                                              )
+    if validation:
+        val_dataset = ImageNet32(root=data_dir, train=True, transform=test_transform)
+        val_dataset = torch.utils.data.Subset(val_dataset, train_dataset.val_indices)
+        return train_dataset, test_dataset, val_dataset
+    return train_dataset, test_dataset, None
